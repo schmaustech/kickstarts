@@ -1,0 +1,204 @@
+#version=RHEL8
+ignoredisk --only-use=vda
+zerombr
+clearpart --all --initlabel
+text
+repo --name="AppStream" --baseurl=file:///run/install/repo/AppStream
+cdrom
+keyboard --vckeymap=us --xlayouts='us'
+lang en_US.UTF-8
+
+network  --bootproto=dhcp --device=ens3 --onboot=off --ipv6=auto --no-activate
+network  --bootproto=dhcp --device=ens4 --ipv6=no --activate
+network  --hostname=rhel8-ocp-auto
+rootpw --iscrypted ENCRYPTED ROOT PASSWORD
+poweroff
+firstboot --disable
+skipx
+services --enabled="chronyd"
+timezone America/Chicago --isUtc
+user --groups=wheel --name=bschmaus --password=ENCRYPTED PASSWORD --iscrypted --gecos="bschmaus"
+part pv.317 --fstype="lvmpv" --ondisk=vda --size=49900
+part /boot --fstype="xfs" --ondisk=vda --size=476
+volgroup rootvg --pesize=4096 pv.317
+logvol swap --fstype="swap" --size=1996 --name=swap --vgname=rootvg
+logvol / --fstype="xfs" --size=47892 --name=root --vgname=rootvg
+
+%packages
+@^server-product-environment
+kexec-tools
+@development
+git
+%end
+
+%addon com_redhat_kdump --enable --reserve-mb='auto'
+
+%end
+
+%anaconda
+pwpolicy root --minlen=6 --minquality=1 --notstrict --nochanges --notempty
+pwpolicy user --minlen=6 --minquality=1 --notstrict --nochanges --emptyok
+pwpolicy luks --minlen=6 --minquality=1 --notstrict --nochanges --notempty
+%end
+
+# Register Host
+%post --interpreter /bin/bash
+subscription-manager register --org=ORG ID  --activationkey=ACTIVATION KEY
+subscription-manager repos --enable=ansible-2-for-rhel-8-x86_64-rpms
+yum -y install ansible
+yum -y upgrade
+%end
+
+# Add Ironic Jinga Template
+%post --interpreter /bin/bash
+
+cat << EOF > /home/bschmaus/ironic_hosts.j2
+{
+  "nodes": [
+{% for host in groups['masters'] %}
+    {
+      "name": "{{ hostvars[host]['inventory_hostname'] }}.{{ hostvars[host]['cluster'] }}.{{ hostvars[host]['domain'] }}",
+      "driver": "ipmi",
+      "resource_class": "baremetal",
+      "driver_info": {
+        "ipmi_username": "admin",
+        "ipmi_password": "password",
+        "ipmi_address": "{{ hostvars[host]['ipmi_address'] }}",
+        "ipmi_port": "{{ hostvars[host]['ipmi_port'] }}",
+        "deploy_kernel": "http://172.22.0.1/images/ironic-python-agent.kernel",
+        "deploy_ramdisk": "http://172.22.0.1/images/ironic-python-agent.initramfs"
+      },
+      "ports": [{
+        "address": "{{ hostvars[host]['mac'] }}",
+        "pxe_enabled": true
+      }],
+      "properties": {
+        "local_gb": "{{ hostvars[host]['disk'] }}",
+        "cpu_arch": "x86_64"
+      }
+{% if loop.last %}
+    }
+{% else %}
+    },
+{% endif %}
+{% endfor %}
+  ]
+}
+EOF
+chmod 755 /home/bschmaus/ironic_hosts.j2
+chown bschmaus:bschmaus /home/bschmaus/ironic_hosts.j2
+%end
+
+# Add config_root.sh Jinga Template
+%post --interpreter /bin/bash
+
+cat << EOF > /home/bschmaus/config_root.j2
+{% for host in groups['bootstrap'] %}
+#!/bin/bash
+set +x
+export PULL_SECRET='{{ hostvars[host]['secret'] }}'
+set -x
+export NODES_FILE="/home/bschmaus/ironic_hosts.json"
+export INT_IF="{{ hostvars[host]['internal'] }}"
+export PRO_IF="{{ hostvars[host]['provision'] }}"
+export ROOT_DISK="{{ hostvars[host]['disk'] }}"
+export NODES_PLATFORM=BM
+export BASE_DOMAIN="{{ hostvars[host]['domain'] }}"
+export CLUSTER_NAME="{{ hostvars[host]['cluster'] }}"
+export MANAGE_BR_BRIDGE="n"
+{% endfor %}
+EOF
+chmod 755 /home/bschmaus/config_root.j2
+chown bschmaus:bschmaus /home/bschmaus/config_root.j2
+%end
+
+# Add Sudo Openshift For bschmaus
+%post --interpreter /bin/bash
+
+cat << EOF > /etc/sudoers.d/openshift
+Defaults:bschmaus !requiretty
+bschmaus ALL = (root) NOPASSWD:ALL
+EOF
+chmod 600 /etc/sudoers.d/openshift
+%end
+
+# Add .ssh directory and authorized_keys for bschmaus user
+%post --interpreter /bin/bash
+
+mkdir /home/bschmaus/.ssh
+chown bschmaus:bschmaus /home/bschmaus/.ssh
+
+cat << EOF > /home/bschmaus/.ssh/authorized_keys
+CAT IN PUBLIC KEY HERE
+EOF
+chmod 600 /home/bschmaus/.ssh/authorized_keys
+chown bschmaus:bschmaus /home/bschmaus/.ssh/authorized_keys
+%end
+
+# Add Jinga Template Playbooks
+%post --interpreter /bin/bash
+cat << 'EOF' > /home/bschmaus/make_ironic_json.yml
+---
+- name: generate ironic json file
+  hosts: all
+  gather_facts: false
+  tasks:
+  - name: generate json file
+    template:
+      src: /home/bschmaus/ironic_hosts.j2
+      dest: /home/bschmaus/ironic_hosts.json
+      mode: '0644'
+    delegate_to: localhost
+    run_once: True
+EOF
+chmod 644 /home/bschmaus/make_ironic_json.yml
+chown bschmaus:bschmaus /home/bschmaus/make_ironic_json.yml
+
+cat << 'EOF' > /home/bschmaus/make_config_root.yml
+---
+- name: generate ironic json file
+  hosts: all
+  gather_facts: false
+  tasks:
+  - name: generate json file
+    template:
+      src: /home/bschmaus/config_root.j2
+      dest: /home/bschmaus/config_root.sh
+      mode: '0755'
+    delegate_to: localhost
+    run_once: True
+EOF
+chmod 644 /home/bschmaus/make_config_root.yml
+chown bschmaus:bschmaus /home/bschmaus/make_config_root.yml
+%end
+
+# Write Out Ansible Hosts
+%post --interpreter /bin/bash
+cat << 'EOF' > /home/bschmaus/hosts
+[masters]
+master-0 name=master-0 cluster=kni5 domain=schmaustech.com ipmi_address=192.168.0.2 ipmi_port=6230 mac=52:54:00:92:43:5c disk=59
+master-1 name=master-1 cluster=kni5 domain=schmaustech.com ipmi_address=192.168.0.3 ipmi_port=6230 mac=52:54:00:b0:54:dd disk=59
+master-2 name=master-2 cluster=kni5 domain=schmaustech.com ipmi_address=192.168.0.6 ipmi_port=6230 mac=52:54:00:57:ab:c3 disk=59
+
+[bootstrap]
+rhel8-ocp-boot
+
+[ocp:children]
+masters
+bootstrap
+
+[masters:vars]
+domain=schmaustech.com
+cluster=kni5
+
+[bootstrap:vars]
+secret='pull secret'
+internal=ens4
+provision=ens3
+disk=/dev/sda
+domain=schmaustech.com
+cluster=kni5
+EOF
+chmod 644 /home/bschmaus/hosts
+chown bschmaus:bschmaus /home/bschmaus/hosts
+%end
